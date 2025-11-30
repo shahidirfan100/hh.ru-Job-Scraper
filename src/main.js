@@ -51,8 +51,11 @@ async function main() {
             proxyConfiguration,
         } = input;
 
-        const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : Number.MAX_SAFE_INTEGER;
-        const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 999;
+        // Input validation
+        const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, Math.min(+RESULTS_WANTED_RAW, 10000)) : 100;
+        const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, Math.min(+MAX_PAGES_RAW, 100)) : 999;
+        
+        log.info(`Starting hh.ru scraper - Target: ${RESULTS_WANTED} jobs, Max pages: ${MAX_PAGES}, Details: ${collectDetails}`);
 
         const toAbs = (href, base = 'https://hh.ru') => {
             try { return new URL(href, base).href; } catch { return null; }
@@ -86,6 +89,16 @@ async function main() {
 
         let saved = 0;
         const seenUrls = new Set();
+        let shouldStop = false; // Flag to stop crawling
+        
+        // Helper function to check if we should continue
+        const shouldContinue = () => {
+            if (saved >= RESULTS_WANTED) {
+                shouldStop = true;
+                return false;
+            }
+            return !shouldStop;
+        };
 
         function extractFromJsonLd($) {
             const scripts = $('script[type="application/ld+json"]');
@@ -189,7 +202,14 @@ async function main() {
             
             // Stealth headers and timing
             preNavigationHooks: [
-                async ({ request, session }) => {
+                async ({ request, session, crawler }) => {
+                    // Stop crawler if limit reached
+                    if (!shouldContinue()) {
+                        crawlerLog.info('Limit reached, skipping remaining requests');
+                        request.skipNavigation = true;
+                        return;
+                    }
+                    
                     // Add stealth headers
                     request.headers = {
                         ...request.headers,
@@ -207,7 +227,13 @@ async function main() {
                 }
             ],
             
-            async requestHandler({ request, $, enqueueLinks, log: crawlerLog, session }) {
+            async requestHandler({ request, $, enqueueLinks, log: crawlerLog, session, crawler }) {
+                // Skip if we've reached the limit
+                if (!shouldContinue()) {
+                    crawlerLog.info('Limit reached, stopping crawler');
+                    return;
+                }
+                
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 0;
                 const startTime = Date.now();
@@ -221,7 +247,7 @@ async function main() {
                         const vacancyCards = $('[data-qa="vacancy-serp__vacancy"]').toArray();
                         const items = [];
                         for (const card of vacancyCards) {
-                            if (saved >= RESULTS_WANTED) break;
+                            if (!shouldContinue()) break;
                             const data = parseVacancyCard($, card);
                             if (data.url && !seenUrls.has(data.url)) {
                                 seenUrls.add(data.url);
@@ -236,14 +262,35 @@ async function main() {
                         if (items.length) {
                             // Batch save for performance
                             await Dataset.pushData(items);
+                            crawlerLog.info(`Saved ${saved}/${RESULTS_WANTED} jobs`);
+                        }
+                        
+                        // Stop crawler if limit reached
+                        if (!shouldContinue()) {
+                            crawlerLog.info('Target reached, stopping crawler');
+                            await crawler.autoscaledPool?.abort();
+                            return;
                         }
                     } else {
+                        // Check if we should continue before enqueuing
+                        if (!shouldContinue()) {
+                            crawlerLog.info('Target reached, not enqueuing more URLs');
+                            return;
+                        }
+                        
                         // Collect detail pages with optimized batching
                         const remaining = RESULTS_WANTED - saved;
-                        const toEnqueue = links.filter(l => !seenUrls.has(l)).slice(0, Math.max(0, remaining));
+                        if (remaining <= 0) {
+                            crawlerLog.info('No remaining jobs needed, stopping');
+                            await crawler.autoscaledPool?.abort();
+                            return;
+                        }
+                        
+                        const toEnqueue = links.filter(l => !seenUrls.has(l)).slice(0, remaining);
                         toEnqueue.forEach(l => seenUrls.add(l));
                         
-                        if (toEnqueue.length) {
+                        if (toEnqueue.length > 0) {
+                            crawlerLog.info(`Enqueuing ${toEnqueue.length} detail pages (${saved}/${RESULTS_WANTED} saved)`);
                             // Batch enqueue for better performance
                             await enqueueLinks({ 
                                 urls: toEnqueue, 
@@ -253,15 +300,18 @@ async function main() {
                         }
                     }
 
-                    // Handle pagination with priority
-                    if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
-                        const next = findNextPage($, request.url, pageNo + 1);
-                        if (next) {
-                            await enqueueLinks({ 
-                                urls: [next], 
-                                userData: { label: 'LIST', pageNo: pageNo + 1 },
-                                forefront: true // Prioritize pagination for faster list crawling
-                            });
+                    // Handle pagination with priority - only if we need more results
+                    if (shouldContinue() && pageNo < MAX_PAGES) {
+                        const remaining = RESULTS_WANTED - saved;
+                        if (remaining > 0) {
+                            const next = findNextPage($, request.url, pageNo + 1);
+                            if (next) {
+                                await enqueueLinks({ 
+                                    urls: [next], 
+                                    userData: { label: 'LIST', pageNo: pageNo + 1 },
+                                    forefront: true // Prioritize pagination for faster list crawling
+                                });
+                            }
                         }
                     }
                     
@@ -276,7 +326,11 @@ async function main() {
                 }
 
                 if (label === 'DETAIL') {
-                    if (saved >= RESULTS_WANTED) return;
+                    // Double-check we still need results
+                    if (!shouldContinue()) {
+                        crawlerLog.info('Limit reached, skipping detail extraction');
+                        return;
+                    }
                     
                     try {
                         // Try JSON-LD first for speed (fastest extraction method)
@@ -340,6 +394,13 @@ async function main() {
                         saved++;
                         crawlerLog.info(`✓ ${saved}/${RESULTS_WANTED}: ${item.title?.substring(0, 40) || 'N/A'}`);
                         
+                        // Check if we've reached the limit after saving
+                        if (!shouldContinue()) {
+                            crawlerLog.info('Target reached after saving, stopping crawler');
+                            await crawler.autoscaledPool?.abort();
+                            return;
+                        }
+                        
                         // Simulate human reading time on detail pages
                         const processingTime = Date.now() - startTime;
                         const minReadTime = STEALTH_CONFIG.delays.minRead;
@@ -359,27 +420,68 @@ async function main() {
             }
         });
 
-        // Run crawler with performance tracking
+        // Run crawler with performance tracking and timeout protection
         const crawlStartTime = Date.now();
-        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 0 } })));
+        
+        try {
+            await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 0 } })));
+        } catch (err) {
+            // Handle crawler errors gracefully
+            if (err.message?.includes('aborted') || shouldStop) {
+                log.info('Crawler stopped after reaching target results');
+            } else {
+                log.error(`Crawler error: ${err.message}`);
+                throw err;
+            }
+        }
         
         const crawlDuration = ((Date.now() - crawlStartTime) / 1000).toFixed(2);
         const avgSpeed = saved > 0 ? (saved / (crawlDuration / 60)).toFixed(1) : 0;
         
-        log.info(`✓ Finished: ${saved} jobs in ${crawlDuration}s (${avgSpeed} jobs/min)`);
+        log.info(`✓ Finished: ${saved}/${RESULTS_WANTED} jobs in ${crawlDuration}s (${avgSpeed} jobs/min)`);
         
-        // Final statistics
+        // Validate results for Apify QA
+        if (saved === 0) {
+            log.warning('No results found. Check search parameters or website availability.');
+        }
+        
+        // Final statistics for Apify platform
         await Actor.setValue('OUTPUT', {
-            success: true,
+            success: saved > 0,
             totalResults: saved,
+            targetResults: RESULTS_WANTED,
             durationSeconds: parseFloat(crawlDuration),
             averageSpeed: parseFloat(avgSpeed),
+            collectDetails: collectDetails,
+            timestamp: new Date().toISOString(),
+            message: saved >= RESULTS_WANTED ? 'Target reached' : `Collected ${saved} of ${RESULTS_WANTED} requested jobs`
+        });
+        
+        // Set exit status for Apify
+        if (saved > 0) {
+            log.info('Actor completed successfully');
+        } else {
+            log.warning('Actor completed with no results');
+        }
+        
+    } catch (error) {
+        log.error(`Fatal error: ${error.message}`, { error: error.stack });
+        
+        // Save error information for debugging
+        await Actor.setValue('OUTPUT', {
+            success: false,
+            error: error.message,
+            totalResults: saved,
             timestamp: new Date().toISOString()
         });
         
+        throw error;
     } finally {
         await Actor.exit();
     }
 }
 
-main().catch(err => { console.error(err); process.exit(1); });
+main().catch(err => { 
+    console.error('Unhandled error:', err); 
+    process.exit(1); 
+});
