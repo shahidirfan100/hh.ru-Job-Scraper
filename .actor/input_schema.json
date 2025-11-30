@@ -1,0 +1,93 @@
+{
+  "title": "hh.ru Jobs Scraper",
+  "description": "Extract job vacancies from hh.ru, Russia's leading job search platform. Search by keywords, location, experience level, and schedule type. Supports detailed scraping with full job descriptions.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "Start scraping from a specific hh.ru search URL. If provided, this will override other search parameters.",
+      "editor": "textfield",
+      "example": "https://hh.ru/search/vacancy?text=python&area=1"
+    },
+    "text": {
+      "title": "Search Keywords",
+      "type": "string",
+      "description": "Job title, skill, or keyword to search for (e.g., 'Python Developer', 'Data Analyst', 'Marketing Manager').",
+      "editor": "textfield",
+      "prefill": "python developer"
+    },
+    "area": {
+      "title": "Region/Area ID",
+      "type": "string",
+      "description": "Region code: 1=Moscow, 2=Saint Petersburg, 113=Russia, 4=Novosibirsk, etc. Leave empty for all regions.",
+      "editor": "textfield",
+      "default": "1"
+    },
+    "experience": {
+      "title": "Experience Level",
+      "type": "string",
+      "description": "Filter by experience level.",
+      "editor": "select",
+      "enum": ["", "noExperience", "between1And3", "between3And6", "moreThan6"],
+      "enumTitles": ["Any", "No experience", "1-3 years", "3-6 years", "More than 6 years"],
+      "default": ""
+    },
+    "schedule": {
+      "title": "Work Schedule",
+      "type": "string",
+      "description": "Filter by work schedule type.",
+      "editor": "select",
+      "enum": ["", "remote", "fullDay", "shift", "flexible", "flyInFlyOut"],
+      "enumTitles": ["Any", "Remote work", "Full-time", "Shift work", "Flexible schedule", "Fly-in fly-out"],
+      "default": ""
+    },
+    "employment": {
+      "title": "Employment Type",
+      "type": "string",
+      "description": "Filter by employment type.",
+      "editor": "select",
+      "enum": ["", "full", "part", "project", "volunteer", "probation"],
+      "enumTitles": ["Any", "Full employment", "Part-time", "Project work", "Volunteer", "Internship"],
+      "default": ""
+    },
+    "collectDetails": {
+      "title": "Collect Full Job Details",
+      "type": "boolean",
+      "description": "Enable to scrape complete job descriptions from detail pages. Disable for faster results with basic info only.",
+      "editor": "checkbox",
+      "default": true
+    },
+    "results_wanted": {
+      "title": "Maximum Jobs to Collect",
+      "type": "integer",
+      "description": "Maximum number of job vacancies to scrape. Set higher for comprehensive results.",
+      "minimum": 1,
+      "maximum": 10000,
+      "default": 100,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Maximum Pages to Crawl",
+      "type": "integer",
+      "description": "Safety limit for the number of search result pages to process.",
+      "minimum": 1,
+      "maximum": 100,
+      "editor": "number",
+      "default": 20
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Proxy settings for accessing hh.ru. Recommended to use residential proxies for reliable access.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
+      }
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}
