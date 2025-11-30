@@ -2,9 +2,42 @@
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
+import { gotScraping } from 'got-scraping';
 
 // Single-entrypoint main
 await Actor.init();
+
+// Stealth configuration with latest browser fingerprints
+const STEALTH_CONFIG = {
+    // Latest Chrome version (Nov 2025)
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    headers: {
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'accept-encoding': 'gzip, deflate, br',
+        'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        'cache-control': 'max-age=0',
+        'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'none',
+        'sec-fetch-user': '?1',
+        'upgrade-insecure-requests': '1',
+    },
+    // Human-like timing patterns
+    delays: {
+        minRead: 800,      // Minimum reading time (ms)
+        maxRead: 2500,     // Maximum reading time (ms)
+        minBrowse: 300,    // Minimum browsing delay (ms)
+        maxBrowse: 1200,   // Maximum browsing delay (ms)
+        networkJitter: 150 // Network latency simulation (ms)
+    }
+};
+
+// Random delay with jitter
+const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function main() {
     try {
@@ -137,15 +170,51 @@ async function main() {
             proxyConfiguration: proxyConf,
             maxRequestRetries: 3,
             useSessionPool: true,
-            maxConcurrency: 5,
-            requestHandlerTimeoutSecs: 90,
-            async requestHandler({ request, $, enqueueLinks, log: crawlerLog }) {
+            sessionPoolOptions: {
+                maxPoolSize: 50,
+                sessionOptions: {
+                    maxAgeSecs: 300,      // Rotate sessions every 5 minutes
+                    maxUsageCount: 15,    // Max 15 requests per session
+                },
+            },
+            // Optimized concurrency - balance between speed and stealth
+            maxConcurrency: collectDetails ? 8 : 12, // Higher for list-only mode
+            minConcurrency: 3,
+            maxRequestsPerMinute: collectDetails ? 120 : 200, // Rate limiting
+            requestHandlerTimeoutSecs: 60,
+            
+            // Advanced retry strategy with exponential backoff
+            maxRequestRetries: 4,
+            retryOnBlocked: true,
+            
+            // Stealth headers and timing
+            preNavigationHooks: [
+                async ({ request, session }) => {
+                    // Add stealth headers
+                    request.headers = {
+                        ...request.headers,
+                        ...STEALTH_CONFIG.headers,
+                        'user-agent': STEALTH_CONFIG.userAgent,
+                        'referer': request.userData?.label === 'DETAIL' ? 'https://hh.ru/search/vacancy' : undefined,
+                    };
+                    
+                    // Human-like delay before request
+                    const delay = randomDelay(
+                        STEALTH_CONFIG.delays.networkJitter, 
+                        STEALTH_CONFIG.delays.networkJitter * 2
+                    );
+                    await sleep(delay);
+                }
+            ],
+            
+            async requestHandler({ request, $, enqueueLinks, log: crawlerLog, session }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 0;
+                const startTime = Date.now();
 
                 if (label === 'LIST') {
                     const links = findJobLinks($, request.url);
-                    crawlerLog.info(`LIST page ${pageNo} (${request.url}) -> found ${links.length} vacancy links`);
+                    crawlerLog.info(`LIST page ${pageNo} -> found ${links.length} vacancy links`);
 
                     // Parse vacancy cards from list page if not collecting details
                     if (!collectDetails) {
@@ -164,92 +233,104 @@ async function main() {
                                 saved++;
                             }
                         }
-                        if (items.length) await Dataset.pushData(items);
+                        if (items.length) {
+                            // Batch save for performance
+                            await Dataset.pushData(items);
+                        }
                     } else {
-                        // Collect detail pages
+                        // Collect detail pages with optimized batching
                         const remaining = RESULTS_WANTED - saved;
                         const toEnqueue = links.filter(l => !seenUrls.has(l)).slice(0, Math.max(0, remaining));
                         toEnqueue.forEach(l => seenUrls.add(l));
+                        
                         if (toEnqueue.length) {
-                            await enqueueLinks({ urls: toEnqueue, userData: { label: 'DETAIL' } });
+                            // Batch enqueue for better performance
+                            await enqueueLinks({ 
+                                urls: toEnqueue, 
+                                userData: { label: 'DETAIL' },
+                                forefront: false // Add to back of queue for natural pacing
+                            });
                         }
                     }
 
-                    // Handle pagination
+                    // Handle pagination with priority
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
                         const next = findNextPage($, request.url, pageNo + 1);
                         if (next) {
-                            await enqueueLinks({ urls: [next], userData: { label: 'LIST', pageNo: pageNo + 1 } });
+                            await enqueueLinks({ 
+                                urls: [next], 
+                                userData: { label: 'LIST', pageNo: pageNo + 1 },
+                                forefront: true // Prioritize pagination for faster list crawling
+                            });
                         }
                     }
+                    
+                    // Simulate human reading time on list pages
+                    const processingTime = Date.now() - startTime;
+                    const minReadTime = STEALTH_CONFIG.delays.minBrowse;
+                    if (processingTime < minReadTime) {
+                        await sleep(minReadTime - processingTime + randomDelay(0, 200));
+                    }
+                    
                     return;
                 }
 
                 if (label === 'DETAIL') {
                     if (saved >= RESULTS_WANTED) return;
+                    
                     try {
+                        // Try JSON-LD first for speed (fastest extraction method)
                         const json = extractFromJsonLd($);
                         const data = json || {};
                         
-                        // Extract vacancy details using hh.ru selectors
-                        if (!data.title) {
-                            data.title = $('h1[data-qa="vacancy-title"]').text().trim() || 
-                                        $('h1.bloko-header-section-1').text().trim() || null;
-                        }
+                        // Parallel extraction for non-JSON-LD fields (optimize DOM queries)
+                        const [title, company, location, salaryEl, experience, employment] = await Promise.all([
+                            data.title || $('h1[data-qa="vacancy-title"]').text().trim() || $('h1.bloko-header-section-1').text().trim() || null,
+                            data.company || $('a[data-qa="vacancy-company-name"]').text().trim() || $('[data-qa="vacancy-company-name"]').text().trim() || null,
+                            data.location || $('[data-qa="vacancy-view-location"]').text().trim() || $('[data-qa="vacancy-view-raw-address"]').text().trim() || null,
+                            data.salary || $('[data-qa="vacancy-salary"]').text().trim() || null,
+                            $('[data-qa="vacancy-experience"]').text().trim() || null,
+                            $('[data-qa="vacancy-view-employment-mode"]').text().trim() || null,
+                        ]);
                         
-                        if (!data.company) {
-                            data.company = $('a[data-qa="vacancy-company-name"]').text().trim() || 
-                                         $('[data-qa="vacancy-company-name"]').text().trim() || null;
-                        }
-                        
-                        if (!data.location) {
-                            data.location = $('[data-qa="vacancy-view-location"]').text().trim() || 
-                                           $('[data-qa="vacancy-view-raw-address"]').text().trim() || null;
-                        }
-                        
-                        if (!data.salary) {
-                            const salaryEl = $('[data-qa="vacancy-salary"]');
-                            data.salary = salaryEl.text().trim() || null;
-                        }
-                        
-                        // Extract experience
-                        const experience = $('[data-qa="vacancy-experience"]').text().trim() || null;
-                        
-                        // Extract employment type
-                        const employment = $('[data-qa="vacancy-view-employment-mode"]').text().trim() || null;
-                        
-                        // Extract skills
+                        // Extract skills efficiently
                         const skills = [];
+                        const keySkills = [];
+                        
                         $('[data-qa="skills-element"]').each((_, el) => {
                             const skill = $(el).text().trim();
                             if (skill) skills.push(skill);
                         });
                         
-                        // Extract description
-                        if (!data.description_html) {
-                            const descEl = $('[data-qa="vacancy-description"]');
-                            data.description_html = descEl && descEl.length ? String(descEl.html()).trim() : null;
-                        }
-                        data.description_text = data.description_html ? cleanText(data.description_html) : null;
-                        
-                        // Extract key skills from description section
-                        const keySkills = [];
                         $('[data-qa="bloko-tag__text"]').each((_, el) => {
                             const skill = $(el).text().trim();
                             if (skill) keySkills.push(skill);
                         });
+                        
+                        // Extract description only if not in JSON-LD
+                        let description_html = data.description_html;
+                        let description_text = null;
+                        
+                        if (!description_html) {
+                            const descEl = $('[data-qa="vacancy-description"]');
+                            description_html = descEl && descEl.length ? String(descEl.html()).trim() : null;
+                        }
+                        
+                        if (description_html) {
+                            description_text = cleanText(description_html);
+                        }
 
                         const item = {
-                            title: data.title || null,
-                            company: data.company || null,
-                            location: data.location || null,
-                            salary: data.salary || null,
+                            title: title,
+                            company: company,
+                            location: location,
+                            salary: salaryEl,
                             experience: experience,
                             employment_type: data.employment_type || employment || null,
                             skills: skills.length > 0 ? skills : (keySkills.length > 0 ? keySkills : null),
                             date_posted: data.date_posted || null,
-                            description_html: data.description_html || null,
-                            description_text: data.description_text || null,
+                            description_html: description_html,
+                            description_text: description_text,
                             url: request.url,
                             source: 'hh.ru',
                             scraped_at: new Date().toISOString(),
@@ -257,16 +338,45 @@ async function main() {
 
                         await Dataset.pushData(item);
                         saved++;
-                        crawlerLog.info(`Saved ${saved}/${RESULTS_WANTED}: ${item.title} - ${item.company}`);
+                        crawlerLog.info(`✓ ${saved}/${RESULTS_WANTED}: ${item.title?.substring(0, 40) || 'N/A'}`);
+                        
+                        // Simulate human reading time on detail pages
+                        const processingTime = Date.now() - startTime;
+                        const minReadTime = STEALTH_CONFIG.delays.minRead;
+                        if (processingTime < minReadTime) {
+                            const delay = minReadTime - processingTime + randomDelay(0, 300);
+                            await sleep(delay);
+                        }
+                        
                     } catch (err) { 
-                        crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`); 
+                        crawlerLog.error(`DETAIL failed: ${err.message}`);
+                        // Mark session as bad on repeated failures
+                        if (session) {
+                            session.markBad();
+                        }
                     }
                 }
             }
         });
 
+        // Run crawler with performance tracking
+        const crawlStartTime = Date.now();
         await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 0 } })));
-        log.info(`Finished. Saved ${saved} items from hh.ru`);
+        
+        const crawlDuration = ((Date.now() - crawlStartTime) / 1000).toFixed(2);
+        const avgSpeed = saved > 0 ? (saved / (crawlDuration / 60)).toFixed(1) : 0;
+        
+        log.info(`✓ Finished: ${saved} jobs in ${crawlDuration}s (${avgSpeed} jobs/min)`);
+        
+        // Final statistics
+        await Actor.setValue('OUTPUT', {
+            success: true,
+            totalResults: saved,
+            durationSeconds: parseFloat(crawlDuration),
+            averageSpeed: parseFloat(avgSpeed),
+            timestamp: new Date().toISOString()
+        });
+        
     } finally {
         await Actor.exit();
     }
